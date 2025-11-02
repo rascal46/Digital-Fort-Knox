@@ -1,0 +1,626 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <WiFiUdp.h>
+
+const char* ssid = "Valar Mougulis";
+const char* password = "vdoh7552";
+
+WebServer server(80);
+Preferences preferences;
+WiFiUDP udp;
+
+struct DeviceInfo {
+  String ip;
+  String mac;
+  String nickname;
+  int rssi;
+  bool isActive;
+  bool isTrusted;
+  bool isNew;
+  unsigned long lastSeen;
+  unsigned long firstSeen;
+  int pingCount;
+  String deviceType;
+};
+
+DeviceInfo devices[50];
+int deviceCount = 0;
+bool monitoringActive = false;
+bool alertOnNewDevice = true;
+int newDeviceAlerts = 0;
+
+IPAddress localIP;
+IPAddress gateway;
+IPAddress subnet;
+String myMAC;
+unsigned long sessionStart = 0;
+unsigned long totalScans = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  
+  Serial.println("\n\n====================================");
+  Serial.println("  Digital Fort Knox - Phase 2.1");
+  Serial.println("  Hotspot-Compatible Version");
+  Serial.println("====================================\n");
+  
+  preferences.begin("fortknox", false);
+  
+  WiFi.mode(WIFI_STA);
+  delay(500);
+  
+  Serial.print("Connecting to: ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+    if (attempts % 10 == 0) {
+      Serial.print(" [" + String(attempts/2) + "s] ");
+    }
+  }
+  
+  Serial.println();
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✓ Connected!");
+    Serial.println("====================================");
+    
+    localIP = WiFi.localIP();
+    gateway = WiFi.gatewayIP();
+    subnet = WiFi.subnetMask();
+    myMAC = WiFi.macAddress();
+    
+    Serial.print("IP Address: ");
+    Serial.println(localIP);
+    Serial.print("MAC Address: ");
+    Serial.println(myMAC);
+    Serial.print("Gateway: ");
+    Serial.println(gateway);
+    Serial.print("Subnet: ");
+    Serial.println(subnet);
+    Serial.print("Signal: ");
+    Serial.print(WiFi.RSSI());
+    Serial.println(" dBm");
+    Serial.println("====================================\n");
+    
+    // Web server setup
+    server.on("/", handleRoot);
+    server.on("/devices", handleDevices);
+    server.on("/trust", handleTrust);
+    server.on("/untrust", handleUntrust);
+    server.on("/rename", handleRename);
+    server.on("/clear", handleClearAlerts);
+    server.on("/scan", handleManualScan);
+    server.begin();
+    
+    Serial.println("✓ Web server started!");
+    Serial.print("✓ Dashboard: http://");
+    Serial.println(localIP);
+    Serial.println("====================================\n");
+    
+    // Add this ESP32 as trusted
+    addOrUpdateDevice(localIP.toString(), myMAC, "ESP32 Monitor");
+    trustDevice(findDeviceByIP(localIP.toString()), "ESP32 Monitor");
+    
+    // Add gateway as trusted
+    addOrUpdateDevice(gateway.toString(), "Router/Gateway", "WiFi Gateway");
+    trustDevice(findDeviceByIP(gateway.toString()), "WiFi Gateway");
+    
+    sessionStart = millis();
+    monitoringActive = true;
+    
+    Serial.println("🔍 Starting network monitoring...");
+    Serial.println("Using hotspot-compatible scanning method");
+    Serial.println("Scans run every 30 seconds\n");
+    
+    // Do initial scan
+    delay(2000);
+    scanNetwork();
+    
+  } else {
+    Serial.println("\n✗ Connection failed!");
+    Serial.print("WiFi Status: ");
+    Serial.println(WiFi.status());
+    Serial.println("\nRestarting in 5 seconds...");
+    delay(5000);
+    ESP.restart();
+  }
+}
+
+void loop() {
+  // Check WiFi connection
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("⚠️  WiFi disconnected! Reconnecting...");
+    WiFi.reconnect();
+    delay(5000);
+    return;
+  }
+  
+  server.handleClient();
+  
+  // Periodic network scan every 30 seconds
+  static unsigned long lastScan = 0;
+  if (millis() - lastScan > 30000) {
+    scanNetwork();
+    lastScan = millis();
+  }
+  
+  // Print stats every 15 seconds
+  static unsigned long lastStats = 0;
+  if (millis() - lastStats > 15000) {
+    Serial.println("📊 Active: " + String(countActive()) + " | Trusted: " + String(countTrusted()) + " | Alerts: " + String(newDeviceAlerts));
+    lastStats = millis();
+  }
+  
+  cleanupOldDevices();
+  delay(10);
+}
+
+void scanNetwork() {
+  if (!monitoringActive) return;
+  
+  Serial.println("\n🔍 Scanning network...");
+  
+  // Get network range
+  uint32_t ipInt = (uint32_t)localIP;
+  uint32_t maskInt = (uint32_t)subnet;
+  uint32_t networkInt = ipInt & maskInt;
+  
+  uint8_t oct1 = networkInt & 0xFF;
+  uint8_t oct2 = (networkInt >> 8) & 0xFF;
+  uint8_t oct3 = (networkInt >> 16) & 0xFF;
+  
+  int found = 0;
+  
+  // Scan common DHCP range (1-50 for mobile hotspots)
+  for (int i = 1; i <= 50; i++) {
+    if (!monitoringActive) break;
+    
+    IPAddress targetIP(oct1, oct2, oct3, i);
+    
+    // Skip our own IP
+    if (targetIP == localIP) continue;
+    
+    // Try to connect to common ports
+    WiFiClient client;
+    bool detected = false;
+    
+    // Method 1: Try HTTP
+    if (client.connect(targetIP, 80, 200)) {
+      client.stop();
+      detected = true;
+    }
+    
+    // Method 2: Try HTTPS
+    if (!detected && client.connect(targetIP, 443, 200)) {
+      client.stop();
+      detected = true;
+    }
+    
+    // Method 3: Try common ports
+    if (!detected) {
+      int ports[] = {8080, 22, 445, 3389, 5000};
+      for (int p = 0; p < 5; p++) {
+        if (client.connect(targetIP, ports[p], 150)) {
+          client.stop();
+          detected = true;
+          break;
+        }
+      }
+    }
+    
+    // Method 4: Send UDP packet to trigger ARP
+    if (!detected) {
+      udp.beginPacket(targetIP, 9);
+      udp.write(0);
+      udp.endPacket();
+      delay(50);
+    }
+    
+    if (detected) {
+      found++;
+      String mac = generateMACFromIP(targetIP);
+      addOrUpdateDevice(targetIP.toString(), mac, "");
+    }
+    
+    // Progress indicator
+    if (i % 10 == 0) {
+      Serial.print(".");
+      yield(); // Allow WiFi to process
+    }
+    
+    delay(50); // Don't overwhelm the network
+  }
+  
+  totalScans++;
+  Serial.println();
+  Serial.println("✓ Scan complete! Found " + String(found) + " devices");
+  Serial.println("  Total devices tracked: " + String(deviceCount));
+  Serial.println();
+}
+
+String generateMACFromIP(IPAddress ip) {
+  // Generate consistent pseudo-MAC from IP
+  // In a real implementation, you'd query ARP table
+  uint8_t lastOctet = ip[3];
+  uint8_t b1 = 0x00;
+  uint8_t b2 = (lastOctet * 17 + 0xAA) % 256;
+  uint8_t b3 = (lastOctet * 31 + 0xBB) % 256;
+  uint8_t b4 = (lastOctet * 47 + 0xCC) % 256;
+  uint8_t b5 = (lastOctet * 61 + 0xDD) % 256;
+  
+  char macStr[18];
+  sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X", b1, b2, b3, b4, b5, lastOctet);
+  return String(macStr);
+}
+
+void addOrUpdateDevice(String ip, String mac, String type) {
+  // Check if exists by IP
+  for (int i = 0; i < deviceCount; i++) {
+    if (devices[i].ip == ip) {
+      devices[i].lastSeen = millis();
+      devices[i].isActive = true;
+      devices[i].pingCount++;
+      devices[i].rssi = WiFi.RSSI(); // Use our WiFi signal as reference
+      
+      // Clear "new" flag after 5 minutes
+      if (millis() - devices[i].firstSeen > 300000) {
+        devices[i].isNew = false;
+      }
+      return;
+    }
+  }
+  
+  // Add new device
+  if (deviceCount < 50) {
+    devices[deviceCount].ip = ip;
+    devices[deviceCount].mac = mac;
+    devices[deviceCount].isActive = true;
+    devices[deviceCount].isTrusted = false;
+    devices[deviceCount].isNew = true;
+    devices[deviceCount].firstSeen = millis();
+    devices[deviceCount].lastSeen = millis();
+    devices[deviceCount].pingCount = 1;
+    devices[deviceCount].rssi = WiFi.RSSI();
+    devices[deviceCount].nickname = "";
+    
+    if (type.length() > 0) {
+      devices[deviceCount].deviceType = type;
+    } else {
+      devices[deviceCount].deviceType = identifyDeviceType(ip, mac);
+    }
+    
+    deviceCount++;
+    
+    if (alertOnNewDevice && !devices[deviceCount-1].isTrusted) {
+      Serial.println("⚠️  NEW DEVICE: " + ip + " | " + mac + " (" + devices[deviceCount-1].deviceType + ")");
+      newDeviceAlerts++;
+    } else {
+      Serial.println("🆕 New: " + ip + " (" + devices[deviceCount-1].deviceType + ")");
+    }
+  }
+}
+
+String identifyDeviceType(String ip, String mac) {
+  if (ip == localIP.toString()) return "ESP32 Monitor";
+  if (ip == gateway.toString()) return "WiFi Gateway";
+  
+  // Identify by MAC OUI
+  if (mac.startsWith("AC:DE:48") || mac.startsWith("E4:5F:01")) return "Xiaomi Device";
+  if (mac.startsWith("00:50:F2") || mac.startsWith("28:6A:BA")) return "Samsung Device";
+  if (mac.startsWith("3C:28:6D") || mac.startsWith("F0:18:98")) return "Apple Device";
+  if (mac.startsWith("CC:9E:A2")) return "OnePlus Device";
+  if (mac.startsWith("00:25:00")) return "Oppo Device";
+  if (mac.startsWith("28:C2:DD")) return "Vivo Device";
+  
+  // Check if it's in typical mobile device range
+  IPAddress ipAddr;
+  ipAddr.fromString(ip);
+  if (ipAddr[3] > 1 && ipAddr[3] < 20) return "Mobile Device";
+  
+  return "Unknown Device";
+}
+
+int findDeviceByIP(String ip) {
+  for (int i = 0; i < deviceCount; i++) {
+    if (devices[i].ip == ip) return i;
+  }
+  return -1;
+}
+
+void trustDevice(int index, String nickname) {
+  if (index < 0 || index >= deviceCount) return;
+  
+  devices[index].isTrusted = true;
+  devices[index].isNew = false;
+  
+  if (nickname.length() > 0) {
+    devices[index].nickname = nickname;
+  }
+  
+  String key = "trust_" + devices[index].ip;
+  preferences.putString(key.c_str(), nickname);
+  
+  Serial.println("✓ Trusted: " + devices[index].ip + " (" + nickname + ")");
+}
+
+void untrustDevice(int index) {
+  if (index < 0 || index >= deviceCount) return;
+  
+  devices[index].isTrusted = false;
+  String key = "trust_" + devices[index].ip;
+  preferences.remove(key.c_str());
+  
+  Serial.println("⊗ Untrusted: " + devices[index].ip);
+}
+
+void cleanupOldDevices() {
+  unsigned long currentTime = millis();
+  unsigned long timeout = 5 * 60 * 1000; // 5 minutes
+  
+  for (int i = 0; i < deviceCount; i++) {
+    if (currentTime - devices[i].lastSeen > timeout && devices[i].isActive) {
+      devices[i].isActive = false;
+      Serial.println("⊗ Offline: " + devices[i].ip);
+    }
+  }
+}
+
+int countActive() {
+  int count = 0;
+  for (int i = 0; i < deviceCount; i++) {
+    if (devices[i].isActive) count++;
+  }
+  return count;
+}
+
+int countTrusted() {
+  int count = 0;
+  for (int i = 0; i < deviceCount; i++) {
+    if (devices[i].isTrusted) count++;
+  }
+  return count;
+}
+
+int countUntrusted() {
+  int count = 0;
+  for (int i = 0; i < deviceCount; i++) {
+    if (devices[i].isActive && !devices[i].isTrusted) count++;
+  }
+  return count;
+}
+
+String formatTime(unsigned long ms) {
+  unsigned long seconds = ms / 1000;
+  unsigned long minutes = seconds / 60;
+  unsigned long hours = minutes / 60;
+  
+  if (hours > 0) return String(hours) + "h " + String(minutes % 60) + "m";
+  if (minutes > 0) return String(minutes) + "m";
+  return String(seconds) + "s";
+}
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<meta http-equiv='refresh' content='15'>";
+  html += "<title>Digital Fort Knox</title>";
+  html += "<style>";
+  html += "*{margin:0;padding:0;box-sizing:border-box}";
+  html += "body{font-family:'Segoe UI',Arial;background:linear-gradient(135deg,#0d1117,#1a1f2e);color:#c9d1d9;padding:20px}";
+  html += "h1{color:#58a6ff;background:linear-gradient(135deg,#161b22,#1c2128);padding:25px;border-radius:12px;margin-bottom:20px;border:1px solid #30363d}";
+  html += ".subtitle{color:#7ee787;font-size:0.9em;margin-top:8px}";
+  html += ".badge{background:#1f6feb;padding:4px 10px;border-radius:12px;font-size:0.75em;margin-left:10px}";
+  html += ".card{background:linear-gradient(135deg,#161b22,#1c2128);padding:20px;margin:15px 0;border-radius:12px;border:1px solid #30363d}";
+  html += ".alert{background:#da3633;border:2px solid #f85149;color:#fff;padding:20px;border-radius:12px;margin:15px 0}";
+  html += ".success{background:#238636;border:2px solid #7ee787;color:#fff;padding:15px;border-radius:8px;margin:15px 0}";
+  html += ".device{margin:12px 0;padding:18px;background:#0d1117;border-left:4px solid #58a6ff;border-radius:8px}";
+  html += ".device-trusted{border-left-color:#7ee787}";
+  html += ".device-untrusted{border-left-color:#f85149}";
+  html += ".device-new{border-left-color:#ffa657;animation:glow 2s ease-in-out infinite}";
+  html += ".ip{font-size:1.1em;font-weight:bold;color:#58a6ff;margin-bottom:8px;font-family:monospace}";
+  html += ".nickname{color:#7ee787;font-size:1.15em;font-weight:600;margin-bottom:5px}";
+  html += ".status{display:inline-block;padding:4px 12px;border-radius:12px;font-size:0.85em;font-weight:600;margin:5px 5px 5px 0}";
+  html += ".status-trusted{background:#238636;color:#7ee787}";
+  html += ".status-untrusted{background:#da3633;color:#ffa198}";
+  html += ".status-new{background:#9e6a03;color:#ffa657}";
+  html += "button{background:#238636;color:#fff;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;font-size:0.9em;margin:5px 5px 5px 0;font-weight:600}";
+  html += "button:hover{background:#2ea043}";
+  html += ".btn-danger{background:#da3633}";
+  html += ".btn-danger:hover{background:#f85149}";
+  html += ".btn-secondary{background:#1f6feb}";
+  html += ".btn-secondary:hover{background:#388bfd}";
+  html += ".stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:15px;margin:15px 0}";
+  html += ".stat-box{background:#0d1117;padding:15px;border-radius:8px;text-align:center;border:1px solid #30363d}";
+  html += ".stat-number{font-size:2em;font-weight:bold;color:#58a6ff}";
+  html += ".stat-label{color:#8b949e;font-size:0.85em;margin-top:5px}";
+  html += ".info{font-size:0.85em;color:#8b949e;margin:5px 0}";
+  html += "@keyframes glow{0%,100%{box-shadow:0 0 5px #ffa657}50%{box-shadow:0 0 20px #ffa657}}";
+  html += "</style></head><body>";
+  
+  html += "<h1>🛡️ Digital Fort Knox<div class='subtitle'>Security Dashboard<span class='badge'>v2.1 Hotspot</span></div></h1>";
+  
+  // Connection status
+  html += "<div class='success'>";
+  html += "✓ Connected to: <strong>" + String(ssid) + "</strong> | ";
+  html += "Signal: <strong>" + String(WiFi.RSSI()) + " dBm</strong> | ";
+  html += "Scans: <strong>" + String(totalScans) + "</strong>";
+  html += "</div>";
+  
+  // Alerts
+  int untrustedActive = countUntrusted();
+  if (untrustedActive > 0 || newDeviceAlerts > 0) {
+    html += "<div class='alert'>";
+    html += "<h3>⚠️ Security Alerts</h3>";
+    if (untrustedActive > 0) {
+      html += "<p>🔴 " + String(untrustedActive) + " untrusted device(s) currently active!</p>";
+    }
+    if (newDeviceAlerts > 0) {
+      html += "<p>🆕 " + String(newDeviceAlerts) + " new device(s) detected this session.</p>";
+    }
+    html += "<button class='btn-danger' onclick='fetch(\"/clear\").then(()=>location.reload())'>Clear Alerts</button>";
+    html += "</div>";
+  }
+  
+  // Statistics
+  html += "<div class='card'>";
+  html += "<h2>📊 Network Status</h2>";
+  html += "<div class='stats-grid'>";
+  html += "<div class='stat-box'><div class='stat-number'>" + String(deviceCount) + "</div><div class='stat-label'>Total</div></div>";
+  html += "<div class='stat-box'><div class='stat-number' style='color:#7ee787'>" + String(countActive()) + "</div><div class='stat-label'>Active</div></div>";
+  html += "<div class='stat-box'><div class='stat-number' style='color:#7ee787'>" + String(countTrusted()) + "</div><div class='stat-label'>Trusted</div></div>";
+  html += "<div class='stat-box'><div class='stat-number' style='color:#f85149'>" + String(untrustedActive) + "</div><div class='stat-label'>Untrusted</div></div>";
+  html += "</div>";
+  html += "<button onclick='fetch(\"/scan\").then(()=>{alert(\"Scanning network...\");setTimeout(()=>location.reload(),15000)})'>🔍 Scan Now</button>";
+  html += "</div>";
+  
+  // Devices
+  html += "<div class='card'>";
+  html += "<h2>🖥️ Monitored Devices</h2>";
+  
+  unsigned long currentTime = millis();
+  
+  // Trusted devices
+  html += "<h3 style='color:#7ee787;margin:20px 0 10px 0'>✓ Trusted Devices</h3>";
+  bool hasTrusted = false;
+  for (int i = 0; i < deviceCount; i++) {
+    if (!devices[i].isTrusted) continue;
+    hasTrusted = true;
+    
+    html += "<div class='device device-trusted'>";
+    if (devices[i].nickname.length() > 0) {
+      html += "<div class='nickname'>✓ " + devices[i].nickname + "</div>";
+    }
+    html += "<div class='ip'>📍 " + devices[i].ip + "</div>";
+    html += "<div class='info'>" + devices[i].mac + " | " + devices[i].deviceType + " | Seen " + String(devices[i].pingCount) + " times</div>";
+    html += "<span class='status status-trusted'>TRUSTED</span>";
+    if (devices[i].isActive) {
+      html += "<span class='status' style='background:#238636'>ONLINE</span>";
+    } else {
+      html += "<span class='status' style='background:#30363d'>OFFLINE</span>";
+    }
+    html += "<button class='btn-danger' onclick='fetch(\"/untrust?ip=" + devices[i].ip + "\").then(()=>location.reload())'>Untrust</button>";
+    html += "<button class='btn-secondary' onclick='rename(\"" + devices[i].ip + "\")'>Rename</button>";
+    html += "</div>";
+  }
+  if (!hasTrusted) {
+    html += "<p style='color:#8b949e;padding:20px'>No trusted devices. Trust devices below to stop alerts.</p>";
+  }
+  
+  // Untrusted devices
+  html += "<h3 style='color:#f85149;margin:20px 0 10px 0'>⚠️ Untrusted Devices</h3>";
+  bool hasUntrusted = false;
+  for (int i = 0; i < deviceCount; i++) {
+    if (devices[i].isTrusted) continue;
+    hasUntrusted = true;
+    
+    String devClass = "device device-untrusted";
+    if (devices[i].isNew) devClass += " device-new";
+    
+    html += "<div class='" + devClass + "'>";
+    html += "<div class='ip'>📍 " + devices[i].ip + "</div>";
+    html += "<div class='info'>" + devices[i].mac + " | " + devices[i].deviceType + "</div>";
+    html += "<div class='info'>First seen: " + formatTime(currentTime - devices[i].firstSeen) + " ago | Detections: " + String(devices[i].pingCount) + "</div>";
+    html += "<span class='status status-untrusted'>UNTRUSTED</span>";
+    if (devices[i].isNew) html += "<span class='status status-new'>NEW</span>";
+    if (devices[i].isActive) {
+      html += "<span class='status' style='background:#238636'>ONLINE</span>";
+    } else {
+      html += "<span class='status' style='background:#30363d'>OFFLINE</span>";
+    }
+    html += "<button onclick='trust(\"" + devices[i].ip + "\")'>Trust Device</button>";
+    html += "<button class='btn-secondary' onclick='rename(\"" + devices[i].ip + "\")'>Name</button>";
+    html += "</div>";
+  }
+  if (!hasUntrusted) {
+    html += "<p style='color:#8b949e;padding:20px'>✓ All devices are trusted!</p>";
+  }
+  
+  html += "</div>";
+  
+  html += "<div style='text-align:center;margin:20px 0;color:#8b949e;font-size:0.9em'>";
+  html += "🔒 Digital Fort Knox v2.1 | Auto-refresh: 15s | Hotspot-Compatible Mode";
+  html += "</div>";
+  
+  html += "<script>";
+  html += "function trust(ip){var n=prompt('Name this device (optional):');fetch('/trust?ip='+ip+'&name='+encodeURIComponent(n||'')).then(()=>location.reload())}";
+  html += "function rename(ip){var n=prompt('New name:');if(n)fetch('/rename?ip='+ip+'&name='+encodeURIComponent(n)).then(()=>location.reload())}";
+  html += "</script>";
+  html += "</body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleDevices() {
+  String json = "{\"total\":" + String(deviceCount) + ",\"active\":" + String(countActive()) + ",\"trusted\":" + String(countTrusted()) + "}";
+  server.send(200, "application/json", json);
+}
+
+void handleTrust() {
+  if (server.hasArg("ip")) {
+    String ip = server.arg("ip");
+    String name = server.hasArg("name") ? server.arg("name") : "";
+    
+    int index = findDeviceByIP(ip);
+    if (index >= 0) {
+      trustDevice(index, name);
+      newDeviceAlerts = 0;
+      server.send(200, "text/plain", "OK");
+      return;
+    }
+  }
+  server.send(400, "text/plain", "Error");
+}
+
+void handleUntrust() {
+  if (server.hasArg("ip")) {
+    String ip = server.arg("ip");
+    int index = findDeviceByIP(ip);
+    if (index >= 0) {
+      untrustDevice(index);
+      server.send(200, "text/plain", "OK");
+      return;
+    }
+  }
+  server.send(400, "text/plain", "Error");
+}
+
+void handleRename() {
+  if (server.hasArg("ip") && server.hasArg("name")) {
+    String ip = server.arg("ip");
+    String name = server.arg("name");
+    
+    int index = findDeviceByIP(ip);
+    if (index >= 0) {
+      devices[index].nickname = name;
+      if (devices[index].isTrusted) {
+        String key = "trust_" + ip;
+        preferences.putString(key.c_str(), name);
+      }
+      Serial.println("✏️  Renamed: " + ip + " to '" + name + "'");
+      server.send(200, "text/plain", "OK");
+      return;
+    }
+  }
+  server.send(400, "text/plain", "Error");
+}
+
+void handleClearAlerts() {
+  newDeviceAlerts = 0;
+  for (int i = 0; i < deviceCount; i++) {
+    devices[i].isNew = false;
+  }
+  Serial.println("✓ Alerts cleared");
+  server.send(200, "text/plain", "OK");
+}
+
+void handleManualScan() {
+  server.send(200, "text/plain", "Scanning...");
+  scanNetwork();
+}
