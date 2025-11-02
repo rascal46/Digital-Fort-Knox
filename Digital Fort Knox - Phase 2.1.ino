@@ -623,4 +623,5 @@ void handleClearAlerts() {
 void handleManualScan() {
   server.send(200, "text/plain", "Scanning...");
   scanNetwork();
+
 }
